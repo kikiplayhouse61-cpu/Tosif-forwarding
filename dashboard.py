@@ -1,510 +1,542 @@
-"""
-dashboard.py
-Telegram Bot controller — inline keyboard dashboard.
-Strictly restricted to ADMIN_USER_ID.
-"""
-
-import asyncio
+import os
+import uuid
 import logging
-import time
-from typing import Optional
 
-from telethon import TelegramClient, events, Button
-from telethon.tl.custom import Message
+from telethon import events, Button
+from telethon.tl.types import (
+    DocumentAttributeSticker,
+    MessageEntityCustomEmoji
+)
 
 import database as db
 from config import config
-from forwarder import get_forwarder
 
 logger = logging.getLogger(__name__)
 
-# ── state machine for multi-step inputs ─────────────────────────────────────
-# key: admin_user_id, value: {"state": str, ...}
-_user_state: dict = {}
+ADMIN_ID = config.ADMIN_USER_ID
 
-STATE_IDLE = "idle"
-STATE_AWAIT_MSG = "await_msg"
-STATE_AWAIT_GROUP_ADD = "await_group_add"
-STATE_AWAIT_GROUP_REMOVE = "await_group_remove"
-STATE_AWAIT_GLOBAL_INTERVAL = "await_global_interval"
-STATE_AWAIT_GROUP_FOR_INTERVAL = "await_group_for_interval"
-STATE_AWAIT_INTERVAL_VALUE = "await_interval_value"
+_dashboard_ids = {}
+_user_states = {}
 
 
-def _admin_only(event) -> bool:
-    return event.sender_id == config.ADMIN_USER_ID
+def _media_directory():
+    base = os.path.dirname(os.path.abspath(config.DB_PATH))
+    path = os.path.join(base, "media")
+    os.makedirs(path, exist_ok=True)
+    return path
 
 
-def _fmt_countdown(seconds_remaining: float) -> str:
-    if seconds_remaining <= 0:
-        return "**due now**"
-    m = int(seconds_remaining // 60)
-    s = int(seconds_remaining % 60)
-    return f"{m}m {s:02d}s"
-
-
-def _fmt_ago(seconds_ago: float) -> str:
-    if seconds_ago < 60:
-        return f"{int(seconds_ago)}s ago"
-    m = int(seconds_ago // 60)
-    s = int(seconds_ago % 60)
-    return f"{m}m {s:02d}s ago"
-
-
-async def _status_text() -> str:
-    fwd = get_forwarder()
-    running = fwd and fwd.is_running
-    groups = db.get_all_groups()
-    global_interval = int(db.get_setting("cycle_interval_minutes") or 17)
-    total_sent = db.get_setting("total_sent") or "0"
-    msg = db.get_latest_message()
-    has_msg = msg is not None
-    now = time.time()
-
-    floods = db.get_recent_flood_logs(5)
-    flood_text = ""
-    if floods:
-        flood_text = "\n\n**⚠️ Recent FloodWaits:**\n"
-        for f in floods:
-            ago = _fmt_ago(now - f["occurred_at"])
-            flood_text += f"  • {f['chat_id']} — waited {f['wait_secs']}s ({ago})\n"
-
-    group_lines = ""
-    for g in groups:
-        interval_mins = g["cycle_interval"] if g["cycle_interval"] is not None else global_interval
-        interval_secs = interval_mins * 60
-        last_sent = g["last_sent_at"] or 0
-        elapsed = now - last_sent if last_sent else None
-        remaining = max(0, interval_secs - (elapsed or interval_secs))
-        title = g["title"] or g["chat_id"]
-        if last_sent:
-            ago_str = _fmt_ago(elapsed)
-            cd_str = _fmt_countdown(remaining)
-            group_lines += f"  • **{title}** — sent {ago_str} | next in {cd_str}\n"
-        else:
-            group_lines += f"  • **{title}** — never sent | ready\n"
-
-    status_icon = "🟢 Running" if running else "🔴 Paused"
-    cur_group = fwd.current_group if fwd else None
-    cur_line = f"\n🔄 Currently sending to: `{cur_group}`" if cur_group else ""
-
-    return (
-        f"**📊 Auto-Forwarder Dashboard**\n\n"
-        f"Status: {status_icon}{cur_line}\n"
-        f"Message set: {'✅' if has_msg else '❌ Not set'}\n"
-        f"Global cycle interval: **{global_interval} min**\n"
-        f"Gap between groups: **60 ± 2–5 s**\n"
-        f"Total groups: **{len(groups)}**\n"
-        f"Total messages sent: **{total_sent}**\n\n"
-        f"**📋 Per-Group Status:**\n"
-        f"{group_lines or '  (no groups added)'}"
-        f"{flood_text}"
-    )
-
-
-def _main_keyboard(running: bool):
-    toggle_label = "⏸ Pause" if running else "▶️ Start"
+def _keyboard():
     return [
-        [Button.inline("📋 Status", b"status"), Button.inline("✉️ Set Message", b"set_msg")],
-        [Button.inline("➕ Add Group", b"add_group"), Button.inline("➖ Remove Group", b"rm_group")],
-        [Button.inline("⏱ Set Interval", b"set_interval"), Button.inline("📊 Groups List", b"groups_list")],
-        [Button.inline(toggle_label, b"toggle"), Button.inline("⏹ Stop & Reset", b"stop")],
-        [Button.inline("🌊 Flood Logs", b"flood_logs"), Button.inline("🔄 Refresh", b"refresh")],
+        [
+            Button.inline("✉️ Set Message", b"setmsg"),
+            Button.inline("📋 Message Preview", b"preview")
+        ],
+        [
+            Button.inline("➕ Add Group", b"addgroup"),
+            Button.inline("➖ Remove Group", b"removegroup")
+        ],
+        [
+            Button.inline("👥 Groups", b"groups"),
+            Button.inline("⏱ Timing", b"timing")
+        ],
+        [
+            Button.inline("📊 Statistics", b"stats"),
+            Button.inline("🌊 Flood Logs", b"flood")
+        ],
+        [
+            Button.inline("▶️ Start", b"startfw"),
+            Button.inline("⏸ Pause", b"pausefw")
+        ],
+        [
+            Button.inline("🔄 Refresh", b"home")
+        ]
     ]
 
 
-def register_handlers(bot: TelegramClient) -> None:
+def _back():
+    return [[Button.inline("⬅️ Back", b"home")]]
 
-    # ── /start ───────────────────────────────────────────────────────────────
 
-    @bot.on(events.NewMessage(pattern="/start"))
-    async def cmd_start(event):
-        if not _admin_only(event):
+def _status(forwarder):
+    groups = db.get_all_groups()
+    message = db.get_latest_message()
+
+    running = forwarder.is_running if forwarder else False
+    total = int(db.get_setting("total_sent", "0"))
+
+    if message:
+        kind = "Sticker" if message["media_type"] == "sticker" else "Text"
+        preview = message.get("text") or "Sticker saved"
+        preview = preview[:100]
+    else:
+        kind = "Not set"
+        preview = "No broadcast message"
+
+    current = forwarder.current_group if forwarder else None
+
+    return (
+        "✦ **HABIBI FORWARDER**\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"Status: {'🟢 Running' if running else '🔴 Paused'}\n"
+        f"Groups: `{len(groups)}`\n"
+        f"Total successful sends: `{total}`\n"
+        f"Content type: `{kind}`\n"
+        f"Content: `{preview}`\n"
+        f"Current group: `{current or 'Idle'}`\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "Select an option below."
+    )
+
+
+async def _show(client, chat_id, text, buttons=None):
+    message_id = _dashboard_ids.get(chat_id)
+
+    if message_id:
+        try:
+            await client.edit_message(
+                chat_id,
+                message_id,
+                text,
+                buttons=buttons
+            )
             return
-        fwd = get_forwarder()
-        running = fwd and fwd.is_running
-        await event.respond(
-            await _status_text(),
-            buttons=_main_keyboard(running),
-        )
-        raise events.StopPropagation
+        except Exception as exc:
+            logger.debug("Dashboard edit failed: %s", exc)
 
-    # ── /help ────────────────────────────────────────────────────────────────
+    sent = await client.send_message(
+        chat_id,
+        text,
+        buttons=buttons
+    )
+    _dashboard_ids[chat_id] = sent.id
 
-    @bot.on(events.NewMessage(pattern="/help"))
-    async def cmd_help(event):
-        if not _admin_only(event):
+
+async def _home(client, forwarder):
+    await _show(
+        client,
+        ADMIN_ID,
+        _status(forwarder),
+        _keyboard()
+    )
+
+
+def _save_custom_emoji_entities(message):
+    result = []
+
+    for entity in message.entities or []:
+        if isinstance(entity, MessageEntityCustomEmoji):
+            result.append({
+                "type": "MessageEntityCustomEmoji",
+                "offset": entity.offset,
+                "length": entity.length,
+                "document_id": entity.document_id
+            })
+
+    return result
+
+
+def register_handlers(bot, forwarder):
+
+    @bot.on(events.NewMessage(
+        incoming=True,
+        func=lambda e: e.is_private
+    ))
+    async def private_messages(event):
+        if event.sender_id != ADMIN_ID:
             return
-        await event.respond(
-            "**Commands:**\n"
-            "/start — open dashboard\n"
-            "/status — live status\n"
-            "/start_fw — start forwarder\n"
-            "/pause_fw — pause forwarder\n\n"
-            "Use the inline buttons for everything else."
-        )
-        raise events.StopPropagation
 
-    # ── /status ──────────────────────────────────────────────────────────────
+        text = (event.raw_text or "").strip()
 
-    @bot.on(events.NewMessage(pattern="/status"))
-    async def cmd_status(event):
-        if not _admin_only(event):
+        if text.startswith("/start"):
+            _user_states.pop(ADMIN_ID, None)
+            await _home(bot, forwarder)
+            try:
+                await event.delete()
+            except Exception:
+                pass
             return
-        fwd = get_forwarder()
-        running = fwd and fwd.is_running
-        await event.respond(await _status_text(), buttons=_main_keyboard(running))
-        raise events.StopPropagation
 
-    # ── /start_fw /pause_fw ──────────────────────────────────────────────────
+        state = _user_states.get(ADMIN_ID)
 
-    @bot.on(events.NewMessage(pattern="/start_fw"))
-    async def cmd_start_fw(event):
-        if not _admin_only(event):
+        if not state:
             return
-        fwd = get_forwarder()
-        if not fwd:
-            await event.respond("❌ Forwarder not initialised yet.")
-            return
-        if fwd.is_running:
-            await event.respond("Already running.")
-        else:
-            fwd.start()
-            await event.respond("▶️ Forwarder started.")
-        raise events.StopPropagation
 
-    @bot.on(events.NewMessage(pattern="/pause_fw"))
-    async def cmd_pause_fw(event):
-        if not _admin_only(event):
-            return
-        fwd = get_forwarder()
-        if not fwd:
-            await event.respond("❌ Forwarder not initialised.")
-            return
-        fwd.pause()
-        await event.respond("⏸ Forwarder paused.")
-        raise events.StopPropagation
+        try:
+            if state == "set_message":
+                msg = event.message
 
-    # ── inline button callbacks ──────────────────────────────────────────────
+                if msg.document:
+                    is_sticker = any(
+                        isinstance(attr, DocumentAttributeSticker)
+                        for attr in (msg.document.attributes or [])
+                    )
+                else:
+                    is_sticker = False
+
+                if is_sticker:
+                    ext = event.file.ext or ".webp"
+                    filename = uuid.uuid4().hex + ext
+                    destination = os.path.join(
+                        _media_directory(), filename
+                    )
+
+                    saved_path = await bot.download_media(
+                        msg,
+                        file=destination
+                    )
+
+                    if not saved_path:
+                        raise RuntimeError("Sticker download failed")
+
+                    db.save_message(
+                        text=msg.raw_text or "",
+                        media_type="sticker",
+                        file_path=str(saved_path),
+                        entities=_save_custom_emoji_entities(msg)
+                    )
+
+                    result = "✅ Telegram sticker saved successfully."
+
+                elif not msg.media and msg.raw_text:
+                    db.save_message(
+                        text=msg.raw_text,
+                        media_type="text",
+                        entities=_save_custom_emoji_entities(msg)
+                    )
+
+                    result = "✅ Text message saved successfully."
+
+                else:
+                    result = (
+                        "❌ Only text, emojis, Premium Custom Emojis "
+                        "and Telegram stickers are supported.\n"
+                        "Photo, video and documents are not accepted."
+                    )
+
+                _user_states.pop(ADMIN_ID, None)
+
+                try:
+                    await event.delete()
+                except Exception:
+                    pass
+
+                await _show(
+                    bot,
+                    ADMIN_ID,
+                    result + "\n\n" + _status(forwarder),
+                    _keyboard()
+                )
+                return
+
+            if state == "add_group":
+                if not text:
+                    return
+
+                member, entity = await forwarder.check_membership(text)
+
+                if not member or entity is None:
+                    result = (
+                        "❌ Your personal Telegram account is not a "
+                        "member of that group."
+                    )
+                else:
+                    from telethon.utils import get_peer_id
+
+                    chat_id = str(get_peer_id(entity))
+                    title = getattr(entity, "title", None) or text
+
+                    if db.add_group(chat_id, title):
+                        result = f"✅ Group added: **{title}**"
+                    else:
+                        result = "⚠️ This group is already added."
+
+                _user_states.pop(ADMIN_ID, None)
+
+                try:
+                    await event.delete()
+                except Exception:
+                    pass
+
+                await _show(
+                    bot, ADMIN_ID,
+                    result + "\n\n" + _status(forwarder),
+                    _keyboard()
+                )
+                return
+
+            if state == "global_interval":
+                minutes = int(text)
+
+                if minutes < 1:
+                    raise ValueError
+
+                db.set_setting("cycle_interval_minutes", minutes)
+                result = f"✅ Default interval set to {minutes} minutes."
+
+                _user_states.pop(ADMIN_ID, None)
+
+                try:
+                    await event.delete()
+                except Exception:
+                    pass
+
+                await _show(
+                    bot, ADMIN_ID,
+                    result + "\n\n" + _status(forwarder),
+                    _keyboard()
+                )
+                return
+
+            if state.startswith("group_interval:"):
+                chat_id = state.split(":", 1)[1]
+                minutes = int(text)
+
+                if minutes < 1:
+                    raise ValueError
+
+                db.set_group_cycle_interval(chat_id, minutes)
+                _user_states.pop(ADMIN_ID, None)
+
+                try:
+                    await event.delete()
+                except Exception:
+                    pass
+
+                await _show(
+                    bot,
+                    ADMIN_ID,
+                    f"✅ Group interval updated to {minutes} minutes.",
+                    _keyboard()
+                )
+                return
+
+        except ValueError:
+            await _show(
+                bot,
+                ADMIN_ID,
+                "❌ Enter a valid number greater than zero.",
+                _back()
+            )
+
+        except Exception as exc:
+            logger.exception("Input processing error: %s", exc)
+            _user_states.pop(ADMIN_ID, None)
+
+            await _show(
+                bot,
+                ADMIN_ID,
+                "❌ Something went wrong while processing your input.",
+                _keyboard()
+            )
 
     @bot.on(events.CallbackQuery)
-    async def cb_handler(event):
-        if not _admin_only(event):
-            await event.answer("⛔ Unauthorised.")
+    async def callbacks(event):
+        if event.sender_id != ADMIN_ID:
+            await event.answer("Not allowed", alert=True)
             return
 
-        data = event.data.decode()
-        fwd = get_forwarder()
-        running = fwd and fwd.is_running
+        data = event.data.decode("utf-8")
+        await event.answer()
 
-        # ── status / refresh ─────────────────────────────────────────────────
-        if data in ("status", "refresh"):
-            await event.edit(
-                await _status_text(),
-                buttons=_main_keyboard(running),
+        if data == "home":
+            _user_states.pop(ADMIN_ID, None)
+            await _home(bot, forwarder)
+
+        elif data == "setmsg":
+            _user_states[ADMIN_ID] = "set_message"
+            await _show(
+                bot,
+                ADMIN_ID,
+                "✉️ **SET BROADCAST CONTENT**\n\n"
+                "Send one of the following:\n"
+                "• Normal text\n"
+                "• Normal emojis\n"
+                "• Telegram Premium Custom Emojis\n"
+                "• Telegram sticker / Premium sticker\n\n"
+                "Photo, video and documents are disabled.\n\n"
+                "Your next message will become the broadcast content.",
+                _back()
             )
 
-        # ── toggle start/pause ───────────────────────────────────────────────
-        elif data == "toggle":
-            if not fwd:
-                await event.answer("Forwarder not ready.")
-                return
-            if running:
-                fwd.pause()
-                await event.answer("⏸ Paused.")
-            else:
-                if not db.get_latest_message():
-                    await event.answer("❌ Set a message first!")
-                    return
-                fwd.start()
-                await event.answer("▶️ Started.")
-            await event.edit(
-                await _status_text(),
-                buttons=_main_keyboard(not running),
-            )
+        elif data == "preview":
+            message = db.get_latest_message()
 
-        # ── stop & reset ─────────────────────────────────────────────────────
-        elif data == "stop":
-            if fwd:
-                fwd.pause()
-            await event.answer("⏹ Stopped.")
-            await event.edit(
-                await _status_text(),
-                buttons=_main_keyboard(False),
-            )
-
-        # ── set message ──────────────────────────────────────────────────────
-        elif data == "set_msg":
-            _user_state[config.ADMIN_USER_ID] = {"state": STATE_AWAIT_MSG}
-            await event.answer()
-            await event.respond(
-                "✉️ **Set Broadcast Message**\n\n"
-                "Send me any message now — text, photo, video, sticker, document, etc.\n"
-                "Whatever you send will become the new broadcast message.\n\n"
-                "Send /cancel to abort."
-            )
-
-        # ── add group ────────────────────────────────────────────────────────
-        elif data == "add_group":
-            _user_state[config.ADMIN_USER_ID] = {"state": STATE_AWAIT_GROUP_ADD}
-            await event.answer()
-            await event.respond(
-                "➕ **Add Group**\n\n"
-                "Send me the group's:\n"
-                "  • `@username`\n"
-                "  • Chat ID (e.g. `-1001234567890`)\n"
-                "  • Invite link (https://t.me/+xxxx)\n\n"
-                "Your Userbot must be a member of that group.\n"
-                "Send /cancel to abort."
-            )
-
-        # ── remove group ─────────────────────────────────────────────────────
-        elif data == "rm_group":
-            groups = db.get_all_groups()
-            if not groups:
-                await event.answer("No groups to remove.")
-                return
-            _user_state[config.ADMIN_USER_ID] = {"state": STATE_AWAIT_GROUP_REMOVE}
-            await event.answer()
-            lines = "\n".join(
-                f"  {i+1}. `{g['chat_id']}` — {g['title'] or '(no title)'}"
-                for i, g in enumerate(groups)
-            )
-            await event.respond(
-                f"➖ **Remove Group**\n\nCurrent groups:\n{lines}\n\n"
-                "Send the Chat ID or @username to remove.\n"
-                "Send /cancel to abort."
-            )
-
-        # ── groups list ──────────────────────────────────────────────────────
-        elif data == "groups_list":
-            groups = db.get_all_groups()
-            if not groups:
-                await event.answer("No groups configured.")
-                return
-            global_iv = int(db.get_setting("cycle_interval_minutes") or 17)
-            now = time.time()
-            lines = []
-            for i, g in enumerate(groups, 1):
-                iv = g["cycle_interval"] if g["cycle_interval"] is not None else global_iv
-                last = g["last_sent_at"]
-                if last:
-                    elapsed = now - last
-                    remaining = max(0, iv * 60 - elapsed)
-                    timing = f"sent {_fmt_ago(elapsed)}, next in {_fmt_countdown(remaining)}"
-                else:
-                    timing = "never sent — ready"
-                lines.append(
-                    f"{i}. **{g['title'] or g['chat_id']}**\n"
-                    f"   ID: `{g['chat_id']}` | interval: {iv}m | {timing}"
+            if not message:
+                text = "No broadcast message has been saved yet."
+            elif message["media_type"] == "sticker":
+                text = (
+                    "📌 **CURRENT CONTENT PREVIEW**\n\n"
+                    "Type: Telegram Sticker\n"
+                    "Status: Saved\n"
+                    "File: Available"
                 )
-            await event.answer()
-            await event.respond("**📋 Groups:**\n\n" + "\n\n".join(lines))
+            else:
+                text = (
+                    "📌 **CURRENT CONTENT PREVIEW**\n\n"
+                    f"{message.get('text') or '(Empty)'}"
+                )
 
-        # ── set interval ─────────────────────────────────────────────────────
-        elif data == "set_interval":
-            await event.answer()
-            await event.respond(
-                "⏱ **Set Interval**\n\n"
-                "Choose what to configure:",
-                buttons=[
-                    [Button.inline("🌍 Global interval", b"interval_global")],
-                    [Button.inline("👥 Per-group interval", b"interval_per_group")],
-                    [Button.inline("« Back", b"status")],
-                ],
+            await _show(bot, ADMIN_ID, text, _back())
+
+        elif data == "addgroup":
+            _user_states[ADMIN_ID] = "add_group"
+            await _show(
+                bot,
+                ADMIN_ID,
+                "➕ **ADD GROUP**\n\n"
+                "Send group username or numeric ID.\n\n"
+                "Important: Your personal Telegram account must "
+                "already be a member of the group.",
+                _back()
             )
 
-        elif data == "interval_global":
-            _user_state[config.ADMIN_USER_ID] = {"state": STATE_AWAIT_GLOBAL_INTERVAL}
-            await event.answer()
-            cur = db.get_setting("cycle_interval_minutes")
-            await event.respond(
-                f"⏱ Current global interval: **{cur} minutes**\n\n"
-                "Send the new interval in **minutes** (e.g. `17`).\n"
-                "Send /cancel to abort."
-            )
-
-        elif data == "interval_per_group":
+        elif data == "removegroup":
             groups = db.get_all_groups()
-            if not groups:
-                await event.answer("No groups yet.")
-                return
-            _user_state[config.ADMIN_USER_ID] = {"state": STATE_AWAIT_GROUP_FOR_INTERVAL}
-            await event.answer()
-            lines = "\n".join(
-                f"  {i+1}. `{g['chat_id']}` — {g['title'] or '(no title)'}"
-                for i, g in enumerate(groups)
-            )
-            await event.respond(
-                f"👥 **Per-Group Interval**\n\nGroups:\n{lines}\n\n"
-                "Send the Chat ID of the group you want to configure.\n"
-                "Send /cancel to abort."
-            )
 
-        # ── flood logs ───────────────────────────────────────────────────────
-        elif data == "flood_logs":
-            floods = db.get_recent_flood_logs(15)
-            if not floods:
-                await event.answer("No FloodWait events recorded.")
+            if not groups:
+                await _show(
+                    bot, ADMIN_ID,
+                    "No groups are currently added.",
+                    _back()
+                )
                 return
-            now = time.time()
-            lines = [
-                f"• `{f['chat_id']}` — waited {f['wait_secs']}s "
-                f"({_fmt_ago(now - f['occurred_at'])})"
-                for f in floods
+
+            buttons = [
+                [Button.inline(
+                    f"❌ {g['title'] or g['chat_id']}"[:60],
+                    f"del:{g['chat_id']}".encode()
+                )]
+                for g in groups
             ]
-            await event.answer()
-            await event.respond(
-                "**🌊 Recent FloodWait Events (last 15):**\n\n" + "\n".join(lines)
+            buttons.append([Button.inline("⬅️ Back", b"home")])
+
+            await _show(
+                bot,
+                ADMIN_ID,
+                "Select the group you want to remove:",
+                buttons
             )
 
-    # ── text message handler (state machine) ─────────────────────────────────
+        elif data.startswith("del:"):
+            chat_id = data.split(":", 1)[1]
+            db.remove_group(chat_id)
 
-    @bot.on(events.NewMessage)
-    async def msg_handler(event: events.NewMessage.Event):
-        if not _admin_only(event):
-            return
-        if event.via_bot_id:
-            return
-
-        text = (event.text or "").strip()
-
-        # cancel
-        if text.lower() == "/cancel":
-            _user_state.pop(config.ADMIN_USER_ID, None)
-            await event.respond("❌ Cancelled.")
-            return
-
-        state_data = _user_state.get(config.ADMIN_USER_ID, {})
-        state = state_data.get("state", STATE_IDLE)
-
-        # ── await broadcast message ──────────────────────────────────────────
-        if state == STATE_AWAIT_MSG:
-            _user_state.pop(config.ADMIN_USER_ID, None)
-            msg = event.message
-
-            if msg.photo:
-                file_id = str(msg.photo.id)
-                caption = msg.text or ""
-                db.save_message(media_type="photo", file_id=file_id, caption=caption)
-                await event.respond("✅ Photo message saved!")
-
-            elif msg.video:
-                file_id = str(msg.video.id)
-                caption = msg.text or ""
-                db.save_message(media_type="video", file_id=file_id, caption=caption)
-                await event.respond("✅ Video message saved!")
-
-            elif msg.document:
-                file_id = str(msg.document.id)
-                caption = msg.text or ""
-                db.save_message(media_type="document", file_id=file_id, caption=caption)
-                await event.respond("✅ Document message saved!")
-
-            elif msg.sticker:
-                file_id = str(msg.sticker.id)
-                db.save_message(media_type="sticker", file_id=file_id)
-                await event.respond("✅ Sticker message saved!")
-
-            elif msg.text:
-                db.save_message(text=msg.text)
-                await event.respond(f"✅ Text message saved:\n\n{msg.text[:200]}")
-
-            else:
-                await event.respond("❌ Unsupported message type.")
-            return
-
-        # ── await group add ───────────────────────────────────────────────────
-        if state == STATE_AWAIT_GROUP_ADD:
-            if not text:
-                await event.respond("❌ Please send a valid group ID, @username, or link.")
-                return
-            _user_state.pop(config.ADMIN_USER_ID, None)
-
-            fwd = get_forwarder()
-            if not fwd:
-                await event.respond("❌ Forwarder not ready.")
-                return
-
-            await event.respond("🔍 Checking membership…")
-            is_member, title = await fwd.check_membership(text)
-
-            if not is_member:
-                await event.respond(
-                    f"❌ Your Userbot is **not a member** of that group.\n"
-                    f"Info: {title}\n\n"
-                    "Join the group with your Userbot account first, then try again."
-                )
-                return
-
-            added = db.add_group(text, title)
-            if added:
-                await event.respond(f"✅ Added: **{title}** (`{text}`)")
-            else:
-                await event.respond(f"ℹ️ Group `{text}` is already in the list.")
-            return
-
-        # ── await group remove ────────────────────────────────────────────────
-        if state == STATE_AWAIT_GROUP_REMOVE:
-            if not text:
-                return
-            _user_state.pop(config.ADMIN_USER_ID, None)
-            removed = db.remove_group(text)
-            if removed:
-                await event.respond(f"✅ Removed group `{text}`.")
-            else:
-                await event.respond(f"❌ Group `{text}` not found in list.")
-            return
-
-        # ── await global interval ─────────────────────────────────────────────
-        if state == STATE_AWAIT_GLOBAL_INTERVAL:
-            _user_state.pop(config.ADMIN_USER_ID, None)
-            try:
-                mins = int(text)
-                assert 1 <= mins <= 1440
-            except (ValueError, AssertionError):
-                await event.respond("❌ Please send a number between 1 and 1440.")
-                return
-            db.set_setting("cycle_interval_minutes", str(mins))
-            await event.respond(f"✅ Global cycle interval set to **{mins} minutes**.")
-            return
-
-        # ── await group for per-group interval ───────────────────────────────
-        if state == STATE_AWAIT_GROUP_FOR_INTERVAL:
-            group = db.get_group(text)
-            if not group:
-                await event.respond(f"❌ Group `{text}` not found.")
-                _user_state.pop(config.ADMIN_USER_ID, None)
-                return
-            _user_state[config.ADMIN_USER_ID] = {
-                "state": STATE_AWAIT_INTERVAL_VALUE,
-                "target_chat_id": text,
-            }
-            cur_iv = group["cycle_interval"] or db.get_setting("cycle_interval_minutes")
-            await event.respond(
-                f"⏱ Current interval for `{text}`: **{cur_iv} min**\n\n"
-                "Send the new interval in **minutes**.\n"
-                "Send `0` to revert to global interval.\n"
-                "Send /cancel to abort."
+            await _show(
+                bot,
+                ADMIN_ID,
+                "✅ Group removed.",
+                _keyboard()
             )
-            return
 
-        # ── await per-group interval value ────────────────────────────────────
-        if state == STATE_AWAIT_INTERVAL_VALUE:
-            chat_id = state_data.get("target_chat_id")
-            _user_state.pop(config.ADMIN_USER_ID, None)
-            try:
-                mins = int(text)
-                assert 0 <= mins <= 1440
-            except (ValueError, AssertionError):
-                await event.respond("❌ Please send a number between 0 and 1440.")
-                return
-            if mins == 0:
-                db.set_group_cycle_interval(chat_id, None)
-                await event.respond(f"✅ Group `{chat_id}` now uses the global interval.")
+        elif data == "groups":
+            groups = db.get_all_groups()
+
+            if not groups:
+                text = "No groups added yet."
             else:
-                db.set_group_cycle_interval(chat_id, mins)
-                await event.respond(
-                    f"✅ Group `{chat_id}` interval set to **{mins} minutes**."
-                )
-            return
+                lines = ["👥 **GROUP LIST**\n"]
+
+                for index, group in enumerate(groups, 1):
+                    interval = group["cycle_interval"] or int(
+                        db.get_setting("cycle_interval_minutes", "17")
+                    )
+
+                    lines.append(
+                        f"{index}. **{group['title'] or group['chat_id']}**\n"
+                        f"ID: `{group['chat_id']}`\n"
+                        f"Interval: `{interval} min`\n"
+                    )
+
+                text = "\n".join(lines)
+
+            await _show(bot, ADMIN_ID, text, _back())
+
+        elif data == "timing":
+            groups = db.get_all_groups()
+
+            buttons = [
+                [Button.inline(
+                    f"⏱ {g['title'] or g['chat_id']}"[:60],
+                    f"gtime:{g['chat_id']}".encode()
+                )]
+                for g in groups
+            ]
+
+            buttons.append([
+                Button.inline("🌐 Default Interval", b"globaltime")
+            ])
+            buttons.append([Button.inline("⬅️ Back", b"home")])
+
+            await _show(
+                bot,
+                ADMIN_ID,
+                "⏱ **TIMING SETTINGS**\n\n"
+                "Choose a group to change its individual interval, "
+                "or set the default interval.\n\n"
+                "Minimum gap between different group sends: 60 seconds.",
+                buttons
+            )
+
+        elif data == "globaltime":
+            _user_states[ADMIN_ID] = "global_interval"
+            await _show(
+                bot,
+                ADMIN_ID,
+                "Send the default interval in minutes.\nExample: `17`",
+                _back()
+            )
+
+        elif data.startswith("gtime:"):
+            chat_id = data.split(":", 1)[1]
+            _user_states[ADMIN_ID] = f"group_interval:{chat_id}"
+
+            await _show(
+                bot,
+                ADMIN_ID,
+                f"Send the interval in minutes for group `{chat_id}`.\n"
+                "Example: `10`",
+                _back()
+            )
+
+        elif data == "stats":
+            stats = db.get_send_stats()
+
+            await _show(
+                bot,
+                ADMIN_ID,
+                "📊 **STATISTICS**\n\n"
+                f"Total attempts: `{stats['total']}`\n"
+                f"Successful: `{stats['success']}`\n"
+                f"Failed: `{stats['failed']}`\n"
+                f"Groups: `{len(db.get_all_groups())}`\n"
+                f"Total successful sends: "
+                f"`{db.get_setting('total_sent', '0')}`",
+                _back()
+            )
+
+        elif data == "flood":
+            logs = db.get_recent_flood_logs(10)
+
+            if not logs:
+                text = "No FloodWait records."
+            else:
+                lines = ["🌊 **RECENT FLOOD LOGS**\n"]
+
+                for item in logs:
+                    lines.append(
+                        f"Group: `{item['chat_id']}`\n"
+                        f"Wait: `{item['wait_secs']} seconds`\n"
+                    )
+
+                text = "\n".join(lines)
+
+            await _show(bot, ADMIN_ID, text, _back())
+
+        elif data == "startfw":
+            forwarder.start()
+            await _home(bot, forwarder)
+
+        elif data == "pausefw":
+            forwarder.pause()
+            await _home(bot, forwarder)
