@@ -1,13 +1,8 @@
-"""
-forwarder.py
-Core forwarding engine.
-"""
-
 import asyncio
-import random
-import time
 import logging
-from typing import Optional
+import os
+import time
+import json
 
 from telethon import TelegramClient
 from telethon.errors import (
@@ -15,192 +10,224 @@ from telethon.errors import (
     ChatWriteForbiddenError,
     UserBannedInChannelError,
     ChannelPrivateError,
-    ChatAdminRequiredError,
+    ChatAdminRequiredError
 )
+from telethon.tl.types import MessageEntityCustomEmoji
+from telethon.utils import get_peer_id
 
 import database as db
-from config import config
 
 logger = logging.getLogger(__name__)
 
-_forwarder_instance: Optional["Forwarder"] = None
+_forwarder_instance = None
 
-PER_MSG_DELAY_BASE = 60
-JITTER_MIN = 2
-JITTER_MAX = 5
-SCHEDULER_TICK = 30
+MIN_GROUP_GAP = 60
+SCHEDULER_TICK = 10
 
 
 class Forwarder:
-    def __init__(self, userbot: TelegramClient):
-        self.userbot = userbot
-        self._task: Optional[asyncio.Task] = None
-        self._running = False
-        self._current_cycle_group: Optional[str] = None
 
+    def __init__(self, userbot):
         global _forwarder_instance
+
+        self.userbot = userbot
+        self._task = None
+        self._running = False
+        self._lock = asyncio.Lock()
+        self.current_group = None
+
         _forwarder_instance = self
 
-    def start(self) -> None:
+    @property
+    def is_running(self):
+        return self._running
+
+    def start(self):
         if self._running:
             return
+
         self._running = True
         db.set_setting("running", "1")
         self._task = asyncio.create_task(self._scheduler_loop())
-        logger.info("Forwarder started.")
 
-    def pause(self) -> None:
+        logger.info("Forwarder started")
+
+    def pause(self):
         self._running = False
         db.set_setting("running", "0")
+
         if self._task and not self._task.done():
             self._task.cancel()
+
         self._task = None
-        logger.info("Forwarder paused.")
+        logger.info("Forwarder paused")
 
-    @property
-    def is_running(self) -> bool:
-        return self._running
+    async def check_membership(self, chat):
+        try:
+            entity = await self.userbot.get_entity(chat)
+            target_id = get_peer_id(entity)
 
-    @property
-    def current_group(self) -> Optional[str]:
-        return self._current_cycle_group
+            async for dialog in self.userbot.iter_dialogs():
+                if get_peer_id(dialog.entity) == target_id:
+                    return True, entity
 
-    async def _scheduler_loop(self) -> None:
-        logger.info("Scheduler loop started.")
+            return False, entity
+
+        except Exception as exc:
+            logger.warning("Membership check failed: %s", exc)
+            return False, None
+
+    async def _scheduler_loop(self):
         while self._running:
             try:
                 await self._run_due_groups()
             except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.exception("Unexpected error in scheduler loop: %s", exc)
+                break
+            except Exception:
+                logger.exception("Scheduler error")
+
             await asyncio.sleep(SCHEDULER_TICK)
 
-    async def _run_due_groups(self) -> None:
-        groups = db.get_all_groups()
-        if not groups:
-            return
+    async def _run_due_groups(self):
+        async with self._lock:
+            groups = db.get_all_groups()
+            now = time.time()
 
-        global_interval_mins = int(db.get_setting("cycle_interval_minutes") or 17)
-        global_interval_secs = global_interval_mins * 60
-
-        due_groups = []
-        now = time.time()
-
-        for g in groups:
-            interval_secs = (
-                g["cycle_interval"] * 60
-                if g["cycle_interval"] is not None
-                else global_interval_secs
+            global_interval = int(
+                db.get_setting("cycle_interval_minutes", "17")
             )
-            last_sent = g["last_sent_at"] or 0
-            if now - last_sent >= interval_secs:
-                due_groups.append(g)
 
-        if not due_groups:
-            return
+            due_groups = []
 
-        logger.info("Cycle: %d groups due for sending.", len(due_groups))
+            for group in groups:
+                interval = group["cycle_interval"] or global_interval
+                last_sent = float(group["last_sent_at"] or 0)
 
-        for idx, group in enumerate(due_groups):
-            if not self._running:
-                break
+                if now >= last_sent + interval * 60:
+                    due_groups.append(group)
 
-            chat_id = group["chat_id"]
-            self._current_cycle_group = chat_id
+            for group in due_groups:
+                if not self._running:
+                    break
 
-            if idx > 0:
-                delay = PER_MSG_DELAY_BASE + random.uniform(JITTER_MIN, JITTER_MAX)
-                logger.info("Waiting %.1f s before sending to %s", delay, chat_id)
-                await asyncio.sleep(delay)
+                last_any = float(
+                    db.get_setting("last_any_send_at", "0")
+                )
 
-            if not self._running:
-                break
+                wait_time = MIN_GROUP_GAP - (time.time() - last_any)
 
-            await self._send_to_group(chat_id)
+                if last_any > 0 and wait_time > 0:
+                    await asyncio.sleep(wait_time)
 
-        self._current_cycle_group = None
+                if not self._running:
+                    break
 
-    async def _send_to_group(self, chat_id: str) -> None:
-        msg = db.get_latest_message()
-        if not msg:
-            logger.warning("No message set, skipping %s", chat_id)
-            return
+                self.current_group = group["title"] or group["chat_id"]
+
+                success = await self._send_to_group(group)
+
+                if success:
+                    sent_at = time.time()
+                    db.update_group_last_sent(group["chat_id"], sent_at)
+                    db.set_setting("last_any_send_at", sent_at)
+                    db.increment_total_sent()
+
+                self.current_group = None
+
+    async def _send_to_group(self, group):
+        chat_id = group["chat_id"]
 
         try:
-            peer = await self._resolve_peer(chat_id)
+            entity = await self.userbot.get_entity(int(chat_id))
+            await self._do_send(entity)
+
+            db.log_send(chat_id, "ok")
+            logger.info("Sent successfully to %s", chat_id)
+            return True
+
+        except FloodWaitError as exc:
+            db.log_flood(chat_id, exc.seconds)
+            db.log_send(chat_id, "flood_wait")
+
+            logger.warning(
+                "Telegram FloodWait: waiting %s seconds",
+                exc.seconds
+            )
+
+            await asyncio.sleep(exc.seconds)
+            return False
+
+        except (
+            ChatWriteForbiddenError,
+            UserBannedInChannelError,
+            ChannelPrivateError,
+            ChatAdminRequiredError
+        ) as exc:
+            logger.error("Cannot send to %s: %s", chat_id, exc)
+            db.log_send(chat_id, "permission_error")
+            return False
+
         except Exception as exc:
-            logger.error("Cannot resolve peer %s: %s", chat_id, exc)
-            db.log_send(chat_id, f"resolve_error: {exc}")
-            return
+            logger.exception("Send failed for %s: %s", chat_id, exc)
+            db.log_send(chat_id, "error")
+            return False
 
-        retries = 3
-        for attempt in range(1, retries + 1):
-            try:
-                await self._do_send(peer, msg)
-                sent_ts = time.time()
-                db.update_group_last_sent(chat_id, sent_ts)
-                db.log_send(chat_id, "ok")
-                db.increment_total_sent()
-                logger.info("Sent to %s at %.0f", chat_id, sent_ts)
-                return
+    async def _do_send(self, entity):
+        message = db.get_latest_message()
 
-            except FloodWaitError as fwe:
-                wait = fwe.seconds + random.randint(2, 6)
-                logger.warning("FloodWait %ds for %s, sleeping...", wait, chat_id)
-                db.log_flood(chat_id, fwe.seconds)
-                db.log_send(chat_id, f"floodwait:{fwe.seconds}")
-                await asyncio.sleep(wait)
+        if not message:
+            raise RuntimeError("No broadcast message has been configured")
 
-            except (
-                ChatWriteForbiddenError,
-                UserBannedInChannelError,
-                ChannelPrivateError,
-                ChatAdminRequiredError,
-            ) as perm_err:
-                logger.error("Permission error on %s: %s — skipping.", chat_id, perm_err)
-                db.log_send(chat_id, f"perm_error: {perm_err}")
-                return
+        text = message.get("text") or ""
+        media_type = message.get("media_type") or "text"
 
-            except Exception as exc:
-                logger.error("Send attempt %d/%d failed for %s: %s", attempt, retries, chat_id, exc)
-                if attempt == retries:
-                    db.log_send(chat_id, f"error: {exc}")
-                else:
-                    await asyncio.sleep(5)
+        entities = []
 
-    async def _do_send(self, peer, msg: dict) -> None:
-        media_type = msg.get("media_type")
-        file_id = msg.get("file_id")
-        caption = msg.get("caption") or ""
-        text = msg.get("text") or ""
+        for item in message.get("entities", []):
+            if item.get("type") == "MessageEntityCustomEmoji":
+                entities.append(
+                    MessageEntityCustomEmoji(
+                        offset=int(item["offset"]),
+                        length=int(item["length"]),
+                        document_id=int(item["document_id"])
+                    )
+                )
 
-        if media_type and file_id:
-            await self.userbot.send_file(peer, file=file_id, caption=caption or None)
+        if media_type == "sticker":
+            path = message.get("file_path")
+
+            if not path or not os.path.isfile(path):
+                raise FileNotFoundError(
+                    "Saved sticker file is missing. Please set the sticker again."
+                )
+
+            await self.userbot.send_file(
+                entity,
+                path,
+                force_document=False
+            )
+
+            # Sticker captions are not supported as sticker captions.
+            # If a text was included with the sticker, send it separately.
+            if text.strip():
+                await self.userbot.send_message(
+                    entity,
+                    text,
+                    formatting_entities=entities or None,
+                    link_preview=False
+                )
+
         else:
-            await self.userbot.send_message(peer, text)
+            if not text.strip():
+                raise RuntimeError("Saved text message is empty")
 
-    async def _resolve_peer(self, chat_id: str):
-        s = str(chat_id).strip()
-        if s.startswith("https://t.me/") or s.startswith("t.me/"):
-            return await self.userbot.get_input_entity(s)
-        try:
-            numeric = int(s)
-            return await self.userbot.get_input_entity(numeric)
-        except ValueError:
-            pass
-        return await self.userbot.get_input_entity(s)
-
-    async def check_membership(self, chat_id: str) -> tuple[bool, str]:
-        try:
-            peer = await self._resolve_peer(chat_id)
-            entity = await self.userbot.get_entity(peer)
-            title = getattr(entity, "title", None) or getattr(entity, "username", str(chat_id))
-            return True, title
-        except Exception as exc:
-            logger.error("Entity resolve error for %s: %s", chat_id, exc)
-            return False, str(exc)
+            await self.userbot.send_message(
+                entity,
+                text,
+                formatting_entities=entities or None,
+                link_preview=False
+            )
 
 
-def get_forwarder() -> Optional["Forwarder"]:
+def get_forwarder():
     return _forwarder_instance
