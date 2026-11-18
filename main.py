@@ -1,83 +1,82 @@
-"""
-main.py
-Entrypoint — runs Userbot (Telethon) and Controller Bot concurrently via asyncio.
-"""
-
 import asyncio
 import logging
-import sys
 
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 
-import database as db
 from config import config
+from database import init_db
 from forwarder import Forwarder
 from dashboard import register_handlers
 
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 )
+
 logger = logging.getLogger(__name__)
 
 
-async def main() -> None:
-    logger.info("Initialising database…")
-    db.init_db()
+async def main():
+    init_db()
 
-    # ── Userbot (personal account) ───────────────────────────────────────────
-    logger.info("Starting Userbot…")
+    logger.info("Starting personal Telegram account...")
+
     userbot = TelegramClient(
         StringSession(config.SESSION_STRING),
         config.API_ID,
-        config.API_HASH,
+        config.API_HASH
     )
-    await userbot.start()
-    me = await userbot.get_me()
-    logger.info("Userbot logged in as: %s (id=%s)", me.username or me.first_name, me.id)
 
-    # ── Forwarder engine ─────────────────────────────────────────────────────
+    await userbot.start()
+
+    me = await userbot.get_me()
+
+    logger.info(
+        "Personal account connected: %s",
+        me.username or me.first_name
+    )
+
     forwarder = Forwarder(userbot)
 
-    # Auto-resume if was running before restart
-    if db.get_setting("running") == "1":
-        logger.info("Resuming forwarder (was running before restart).")
-        forwarder.start()
+    if config.BOT_TOKEN:
+        logger.info("Starting controller bot...")
 
-    # ── Controller Bot ───────────────────────────────────────────────────────
-    logger.info("Starting Controller Bot…")
-    bot = TelegramClient(
-        "bot_session",
-        config.API_ID,
-        config.API_HASH,
-    )
-    await bot.start(bot_token=config.BOT_TOKEN)
-    bot_me = await bot.get_me()
-    logger.info("Controller Bot started: @%s", bot_me.username)
-
-    register_handlers(bot)
-
-    # Notify admin on startup
-    try:
-        await bot.send_message(
-            config.ADMIN_USER_ID,
-            f"✅ **System online**\n"
-            f"Userbot: `{me.username or me.first_name}`\n"
-            f"Forwarder: {'▶️ Running' if forwarder.is_running else '⏸ Paused'}\n\n"
-            "Use /start to open the dashboard.",
+        bot = TelegramClient(
+            "bot_session",
+            config.API_ID,
+            config.API_HASH
         )
-    except Exception as exc:
-        logger.warning("Could not send startup message: %s", exc)
 
-    logger.info("All systems up. Running until interrupted.")
+        await bot.start(bot_token=config.BOT_TOKEN)
 
-    # Run both clients concurrently
-    await asyncio.gather(
-        userbot.run_until_disconnected(),
-        bot.run_until_disconnected(),
-    )
+        register_handlers(bot, forwarder)
+
+        try:
+            await bot.send_message(
+                config.ADMIN_USER_ID,
+                "✅ **Forwarder system online**\n\n"
+                f"Personal account: `{me.username or me.first_name}`\n"
+                "Send /start to open the dashboard."
+            )
+        except Exception as exc:
+            logger.warning("Startup notification failed: %s", exc)
+
+        if config_running := __import__(
+            "database"
+        ).get_setting("running", "0") == "1":
+            forwarder.start()
+
+        logger.info("Both Telegram clients are running.")
+
+        await asyncio.gather(
+            userbot.run_until_disconnected(),
+            bot.run_until_disconnected()
+        )
+
+    else:
+        logger.error("BOT_TOKEN is missing.")
 
 
 if __name__ == "__main__":
