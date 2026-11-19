@@ -64,6 +64,13 @@ class Forwarder:
 
     async def check_membership(self, chat):
         try:
+            chat = str(chat).strip()
+
+            try:
+                chat = int(chat)
+            except ValueError:
+                pass
+
             entity = await self.userbot.get_entity(chat)
             target_id = get_peer_id(entity)
 
@@ -74,7 +81,10 @@ class Forwarder:
             return False, entity
 
         except Exception as exc:
-            logger.warning("Membership check failed: %s", exc)
+            logger.warning(
+                "Membership check failed for %s: %s",
+                chat, exc
+            )
             return False, None
 
     async def _scheduler_loop(self):
@@ -231,3 +241,4 @@ class Forwarder:
 
 def get_forwarder():
     return _forwarder_instance
+                
